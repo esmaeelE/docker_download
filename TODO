@@ -3,4 +3,5 @@
 - Add check to install requirement
 - Maybe it will become a usable wrapper to original scripts
 - Add it to original cli `docker image download`
+- Fix error when download intrupted
 
