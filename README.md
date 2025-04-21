@@ -54,6 +54,16 @@ After that, you can directly call `dn_docker` and remove the leading `./` from t
 
 If you are unable to access the Docker registry at docker.io, some possible solutions include using a proxy or a VPN. However, addressing internet censorship is beyond the scope of this repository.
 
+
+### Docker error while run docker pull
+
+```
+Error response from daemon: pull access denied for postgres, repository does not exist or may require 'docker login': denied: <html><body><h1>403 Forbidden</h1>
+Since Docker is a US company, we must comply with US export control regulations. In an effort to comply with these, we now block all IP addresses that are located in Cuba, Iran, North Korea, Republic of Crimea, Sudan, and Syria. If you are not in one of these cities, countries, or regions and are blocked, please reach out to https://hub.docker.com/support/contact/
+</body></html>
+```
+
+
 Export proxy in current shell
 ```
 export {http,https,ftp}_proxy="10.10.34.42:8080"
@@ -71,5 +81,4 @@ Or, if you are connected to a VPN server, all traffic will be routed through the
 ## Links
 
 - [Baeldung post](https://www.baeldung.com/ops/docker-download-image-no-client)
-
 
