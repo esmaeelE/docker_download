@@ -13,7 +13,29 @@ By using this script, `docker pull` turns to `dn_docker dir_name image_name:tag`
 ---
 
 **Hint**
-This is not a miracle. I just used [Mobi's docker script](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh) with some slight improvements.
+- This is not a miracle. I just used [Mobi's docker script](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh) with some slight improvements.
+- This version only works for `docker.io` registry. I will add some other registry soon.
+
+## Usage
+To download image from a registry go to https://hub.docker.com/ and sereach for it.
+
+For example here is hello world page:
+
+https://hub.docker.com/_/hello-world
+
+For default you use probably run this command:
+```
+docker pull hello-world:nanoserver-ltsc2025
+```
+
+But to download which this script run:
+```
+ ./dn_docker helloworld_dir hello-world:nanoserver-ltsc2025
+```
+
+
+---
+
 
 Most important ones are:
 - Use `aria2` downloader instead of `curl`.
