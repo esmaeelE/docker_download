@@ -460,14 +460,20 @@ echo "Download of images into '$dir' complete."
 echo "Use something like the following to load the result into a Docker daemon:"
 echo "  tar -cC '$dir' . | docker load"
 
+# load from directory
+# tar -cC ${dir} . | docker load
+
 ########################################################################################################
 # create archive and load image
 ########################################################################################################
 tar -cvC ${dir} . | gzip -c -9 >${image}.tar.gz
 
 # do you want to remove downloaded directroy?
-rm -rf ${dir}
+# rm -rf ${dir}
 
 # do you want to load image to current machine?
+# this error unexpected end of JSON input, it seems error in download
+# may its for internet issue in IRAN
+
 docker load -i ${image}.tar.gz
 ########################################################################################################
