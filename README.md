@@ -16,6 +16,7 @@ By using this script, `docker pull` turns to `dn_docker dir_name image_name:tag`
 This is not a miracle. I just used [Mobi's docker script](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh) with some slight improvements.
 
 Most important ones are:
+
 - Use `aria2` downloader instead of `curl`.
 - Move download command to bash function.
 - Add bash commands to `download`, `archive`, `compress` and `load` docker image.
@@ -23,14 +24,16 @@ Most important ones are:
 
 ---
 
-## Usage 
+## Usage
 
 ### Prerequisite
+
 ```
-$ sudo apt install curl aria2c jq tar gzip
+sudo apt install curl aria2c jq tar gzip
 ```
 
 Download `dn_docker` script and make it executable
+
 ```
 git clone git@github.com:esmaeelE/docker_download.git
 cd docker_download
@@ -46,14 +49,14 @@ sudo mv dn_docker /usr/local/bin/
 After that, you can directly call `dn_docker` and remove the leading `./` from the commands below.
 
 ### Run
+
 ```
 ./dn_docker dir_name image_name:tag
 ```
 
-## Use in restricted countires 
+## Use in restricted countires
 
 If you are unable to access the Docker registry at docker.io, some possible solutions include using a proxy or a VPN. However, addressing internet censorship is beyond the scope of this repository.
-
 
 ### Docker error while run docker pull
 
@@ -63,22 +66,21 @@ Since Docker is a US company, we must comply with US export control regulations.
 </body></html>
 ```
 
-
 Export proxy in current shell
+
 ```
 export {http,https,ftp}_proxy="10.10.34.42:8080"
 ./dn_docker dir_name image_name:tag
 ```
 
 Utilize `proxychains` to route connections through proxy servers prior to invoking `dn_docker`.
+
 ```
 proxychanis4 ./dn_docker dir_name image_name:tag
 ```
 
 Or, if you are connected to a VPN server, all traffic will be routed through the established connection.
 
-
 ## Links
 
 - [Baeldung post](https://www.baeldung.com/ops/docker-download-image-no-client)
-
