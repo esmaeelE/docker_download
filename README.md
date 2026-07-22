@@ -1,62 +1,39 @@
-# docker_download
+# docker_dn
 
-Docker image downloader
+Docker image downloader — bypass `docker pull` by downloading image layers directly from the registry.
 
-When you call `docker pull image:tag` it will establish a connection to the docker image registry, get image layers and load them to docker.
+Based on [Moby's `download-frozen-image-v2.sh`](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh) with improvements: `aria2c` parallel downloads, multi-registry support, resume, checksum verification, and colored output.
 
-But in some situations it's not as simple as above.
-For example, the `docker.io` website sanctions or anything like that. So we need a good traditional way.
-Download image layers with separate tools and feed to docker.
+## Why
 
-By using this script, `docker pull` turns to `docker_dn dir_name image_name:tag`
-
-- [HINT] This is not a miracle. I just used [Mobi's docker script](<https://github.com/moby/moby/blob/master/contrib/>
-download-frozen-image-v2.sh) with some slight improvements.
-
-- This version only works for `docker.io` registry. I will add some other registry soon.
-
----
-
-## Usage
-
-To download image from a registry go to <https://hub.docker.com/> and sereach for it.
-
-For example here is hello world page:
-
-<https://hub.docker.com/_/hello-world>
-
-For default you use probably run this command:
+When `docker pull` is blocked (sanctions, 403 from docker.io, corporate proxies), this tool downloads image layers via `aria2c`, creates a tarball, and loads it into Docker.
 
 ```bash
-docker pull hello-world:nanoserver-ltsc2025
+# instead of:
+docker pull hello-world:latest
+
+# use:
+./docker_dn -d output -i hello-world:latest
 ```
 
-But to download which this script run:
+## Supported Registries
+
+| Registry | Prefix |
+|----------|--------|
+| Docker Hub | _(default)_ |
+| GitHub Container Registry | `ghcr.io/` |
+| Google Container Registry | `gcr.io/` |
+| Quay | `quay.io/` |
+
+## Install
+
+### Prerequisites
 
 ```bash
-./docker_dn helloworld_dir hello-world:nanoserver-ltsc2025
+sudo apt install curl jq aria2c tar gzip docker.io
 ```
 
----
-
-Most important ones are:
-
-- Use `aria2` downloader instead of `curl`.
-- Move download command to bash function.
-- Add bash commands to `download`, `archive`, `compress` and `load` docker image.
-- Currently tested only on Debian 12, 13, and Ubuntu 24.04.
-
----
-
-## Usage
-
-### Prerequisite
-
-```bash
-sudo apt install curl aria2c jq tar gzip
-```
-
-Download `docker_dn` script and make it executable
+### Setup
 
 ```bash
 git clone git@github.com:esmaeelE/docker_download.git
@@ -64,53 +41,121 @@ cd docker_download
 chmod +x docker_dn
 ```
 
-Also you can place `docker_dn` to `$PATH`
+Optional — install globally:
 
 ```bash
 sudo mv docker_dn /usr/local/bin/
 ```
 
-After that, you can directly call `docker_dn` and remove the leading `./` from the commands below.
+## Usage
 
-### Run
+```
+docker_dn -d dir -i image[:tag][@digest] ... [options]
 
-```bash
-./docker_dn dir_name image_name:tag
+Options:
+  -d DIR        Output directory for downloading layers
+  -i IMAGE      Image name with optional tag/digest (can be repeated)
+  -f FILE       Read image list from file (one per line)
+  -o FILE       Archive output filename (default: <image>.tar.gz)
+  --proxy URL   Proxy URL for curl and aria2c (e.g. http://host:port)
+  --clean       Remove download directory after successful load
+  --no-load     Download and archive only, skip docker load
+  --dry-run     Show what would be downloaded, then exit
+  --verbose     Show debug output
+  --quiet       Suppress non-error output
+  --version     Show version
+  -h, -?        Show this help message
 ```
 
-### Example
+### Basic
 
 ```bash
-./docker_dn hell hello-world:tag
+./docker_dn -d hello_dir -i hello-world:latest
 ```
 
-## Use in restricted countires
-
-If you are unable to access the Docker registry at docker.io, some possible solutions include using a proxy or a VPN. However, addressing internet censorship is beyond the scope of this repository.
-
-### Docker error while run docker pull
+### Download only (no docker load)
 
 ```bash
-Error response from daemon: pull access denied for postgres, repository does not exist or may require 'docker login': denied: <html><body><h1>403 Forbidden</h1>
-Since Docker is a US company, we must comply with US export control regulations. In an effort to comply with these, we now block all IP addresses that are located in Cuba, Iran, North Korea, Republic of Crimea, Sudan, and Syria. If you are not in one of these cities, countries, or regions and are blocked, please reach out to https://hub.docker.com/support/contact/
-</body></html>
+./docker_dn -d out -i nginx:alpine --no-load
+# creates out/nginx_alpine.tar.gz
 ```
 
-Export proxy in current shell
+### Custom archive name
+
+```bash
+./docker_dn -d out -i redis:7 -o redis-bundle.tar.gz
+```
+
+### Batch download from file
+
+```bash
+cat images.txt
+# hello-world:latest
+# nginx:alpine
+# postgres:16
+
+./docker_dn -d out -f images.txt --no-load
+```
+
+### With proxy
+
+```bash
+./docker_dn -d out -i nginx:alpine --proxy http://10.0.0.1:8080
+```
+
+### Quiet mode (for scripts)
+
+```bash
+./docker_dn -d out -i nginx:alpine --quiet --clean
+```
+
+## Features
+
+- **Parallel downloads** — `aria2c` with 16 connections per layer
+- **Resume** — interrupted downloads resume from where they stopped (`.done` file tracks completed layers)
+- **Checksum verification** — SHA-256 verified against manifest digest after each download
+- **Disk space check** — warns if image size exceeds available disk space
+- **Multi-registry** — Docker Hub, GHCR, GCR, Quay auto-detected from image prefix
+- **Colored output** — errors in red, warnings in yellow, success in green (auto-disabled in non-terminal / `--quiet`)
+- **Cleanup trap** — partial downloads preserved on failure for resume
+
+## Restricted Countries
+
+If docker.io blocks your IP (403 Forbidden), use the built-in proxy flag:
+
+```bash
+./docker_dn -d out -i nginx:alpine --proxy 10.10.34.42:8080
+```
+
+Or set proxy via environment:
 
 ```bash
 export {http,https,ftp}_proxy="10.10.34.42:8080"
-./docker_dn dir_name image_name:tag
+./docker_dn -d out -i nginx:alpine
 ```
 
-Utilize `proxychains` to route connections through proxy servers prior to invoking `docker_dn`.
+Or use `proxychains`:
 
 ```bash
-proxychanis4 ./docker_dn dir_name image_name:tag
+proxychains4 ./docker_dn -d out -i nginx:alpine
 ```
 
-Or, if you are connected to a VPN server, all traffic will be routed through the established connection.
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Usage error / dependency missing |
+| 2 | Auth failure |
+| 3 | Download / checksum failure |
+| 4 | Docker load failure |
+
+## Tested On
+
+- Debian 12, 13
+- Ubuntu 24.04
 
 ## Links
 
 - [Baeldung post](https://www.baeldung.com/ops/docker-download-image-no-client)
+- [Moby's original script](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh)

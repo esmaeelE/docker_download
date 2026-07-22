@@ -1,7 +1,34 @@
+# TODO
 
-- Write bash CLI for it
-- Add check to install requirement
-- Maybe it will become a usable wrapper to original scripts
-- Add it to original cli `docker image download`
-- Fix error when download intrupted
+## High Priority
+
+### 1. Fix multi-image archive
+CLI collects `imageArgs=()` but tail uses `${image//\//_}` (last image only).
+Multiple `-i` produces broken archive. Should iterate all images or warn.
+
+### 2. Token caching
+`get_token` called per-layer inside loops. Token valid ~300s.
+Cache once per image, reuse across layers.
+
+---
+
+## Medium Priority
+
+### 3. Parallel multi-image download
+Download multiple images concurrently with `&` + `wait`.
+
+---
+
+## Low Priority
+
+### 4. Lock file
+Prevent two instances writing to same dir simultaneously (flock).
+
+### 5. Add to upstream CLI
+Maybe it will become a usable wrapper to original scripts.
+Add to original cli `docker image download`.
+
+### 6. Python rewrite
+Bash script with complex logic (HTTP redirects, JSON parsing, state management).
+Python would simplify significantly — better error handling, argparse, requests library.
 
