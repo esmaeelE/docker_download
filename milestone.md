@@ -2,82 +2,46 @@
 
 ## High Priority (Quick Wins)
 
-### 1. Fix filename bug
-`${image}.tar.gz` breaks when `$image` contains `/` (e.g., `library/hello-world`):
-```bash
-imageFile="${image//\//_}"  # use existing var, already defined in script
-tar -cvC "${dir}" . | gzip -c -9 >"${imageFile}.tar.gz"
-```
+### 1. Fix filename bug — DONE
+Archive naming now avoids `/` issues by normalizing image names (e.g. `${image//\//_}`) and supports multi-image archive names (e.g. `a+b.tar.gz`).
 
-### 2. Quote all variables
-Unquoted variables break on paths with spaces:
-```bash
-# Bad:
-dn $blobRedirect $targetFile
-# Good:
-dn "$blobRedirect" "$targetFile"
-```
+### 2. Quote all variables — IN PROGRESS (improved)
+Most command/path handling is quoted. ShellCheck (`-S warning`) is clean and style-level issues found were fixed (e.g. direct exit-status checks for `aria2c`/runtime load); remaining style finding is a false positive on the trap-installed cleanup function. Further auditing for uncommon paths/inputs can continue.
 
-### 3. Check all dependencies at startup
-Currently only checks `curl` and `jq`, missing `aria2c`, `tar`, `gzip`, `docker`:
-```bash
-for cmd in curl jq aria2c tar gzip docker; do
-    if ! command -v "$cmd" &>/dev/null; then
-        echo >&2 "error: \"$cmd\" not found!"
-        exit 1
-    fi
-done
-```
+### 3. Check dependencies/startup requirements — DONE (updated)
+Startup checks core tools (`curl`, `jq`, `aria2c`, `tar`, `gzip`). Container runtime handling now supports Docker or Podman:
+- auto-detects `podman` (preferred) or `docker` for loading
+- allows explicit selection via `--runtime` / `CONTAINER_RUNTIME`
+- requires a runtime only when loading is needed (`--dry-run`/`--no-load` can run without one)
 
-### 4. Proper CLI flags
-Replace positional args with flags:
-```bash
-./docker_dn -d output_dir -i hello-world:latest
-./docker_dn -h  # help
-```
+### 4. Proper CLI flags — DONE
+The script uses flag-based CLI (`-d`, `-i`, `-f`, `-o`, `--proxy`, `--clean`, `--no-load`, `--dry-run`, etc.) with `-h`/`--version` support.
 
 ---
 
 ## Medium Priority
 
-### 5. Multi-registry support
-Add support for other registries:
+### 5. Multi-registry support — DONE
+Supported registries include Docker Hub (`docker.io`, default), GHCR (`ghcr.io`), GCR (`gcr.io`), and Quay (`quay.io`) with prefix-based detection and registry-specific auth endpoints.
 
-| Registry | Base URL |
-|----------|----------|
-| GCR | `gcr.io` |
-| GHCR | `ghcr.io` |
-| Quay | `quay.io` |
+### 6. Resume on failure — DONE
+Completed blobs/layers are tracked in `$dir/.done` so interrupted downloads can be resumed by rerunning the same command.
 
-Detection logic: parse image prefix → set registry base URL.
-
-### 6. Resume on failure
-Track completed layers in a state file. On restart, skip completed layers.
-
-### 7. Cleanup on failure
-Trap errors and remove partial downloads:
-```bash
-cleanup() { rm -rf "$dir"; }
-trap cleanup ERR
-```
+### 7. Cleanup on failure — DONE (resume-friendly)
+Failure handling preserves partial downloads when a download is interrupted/incomplete so they can be resumed; successful runs clean up state as appropriate (and `--clean` removes the download directory after a successful load flow).
 
 ---
 
 ## Low Priority
 
-### 8. Consider rewriting in Python
-The Bash script is already ~480 lines with complex logic (HTTP redirects, JSON parsing, state management). Python would:
-- Better error handling
-- Easier multi-registry support
-- Proper argument parsing with `argparse`
-- `requests` library handles redirects/headers cleanly
-- Cross-platform without bash version hacks
+### 8. Consider rewriting in Python — OPEN
+The Bash script remains featureful but complex (HTTP/auth flows, manifests, JSON/state handling). A Python rewrite could improve maintainability, argument parsing, and error handling.
 
-### 9. Batch download support
-Read a list of images from a file:
-```bash
-./docker_dn -f images.txt  # downloads all images in file
-```
+### 9. Batch download support — DONE
+Images can be provided via `-f <file>` (one image per line) in addition to repeated `-i` arguments.
 
-### 10. Checksum verification
-Verify downloaded layer integrity against manifest digests.
+### 10. Checksum verification — DONE
+Downloaded blobs are verified against manifest digests (SHA-256) before being recorded as complete.
+
+### 11. Parallel multi-image download — DONE
+When multiple images are requested, per-image processing runs in parallel background jobs with aggregation in original argument order. Shared blob downloads are synchronized with per-digest locks to handle shared layers safely.

@@ -2,33 +2,50 @@
 
 ## High Priority
 
-### 1. Fix multi-image archive
-CLI collects `imageArgs=()` but tail uses `${image//\//_}` (last image only).
-Multiple `-i` produces broken archive. Should iterate all images or warn.
+### 1. Fix multi-image archive — DONE
+~~CLI collects `imageArgs=()` but tail uses `${image//\//_}` (last image only).
+Multiple `-i` produces broken archive. Should iterate all images or warn.~~
+Fixed: archive name now includes all pulled images (e.g. `a+b.tar.gz`), tags
+tmp keys are registry-qualified via `rawImageArg`, `repositories` keys use the
+full image reference.
 
-### 2. Token caching
-`get_token` called per-layer inside loops. Token valid ~300s.
-Cache once per image, reuse across layers.
+### 2. Token caching — DONE
+~~`get_token` called per-layer inside loops. Token valid ~300s.
+Cache once per image, reuse across layers.~~
+Fixed: `registryToken` cached once per image in `refresh_token`, reused by
+`fetch_blob`, refreshed once on 401, persistent 401 exits `EX_AUTH` (2).
+
+### 3. Podman/Docker runtime support — DONE
+~~Script required `docker` for dependency checks/loading and only used Docker commands.~~
+Fixed: auto-detects container runtime for loading (`podman` preferred, then `docker`),
+supports explicit selection via `--runtime` and `CONTAINER_RUNTIME`, and allows
+download/archive flows without a runtime when using `--dry-run` or `--no-load`.
 
 ---
 
 ## Medium Priority
 
-### 3. Parallel multi-image download
-Download multiple images concurrently with `&` + `wait`.
+### 4. Parallel multi-image download — DONE
+~~Download multiple images concurrently with `&` + `wait`.~~
+Fixed: when multiple images are requested, per-image processing runs in parallel
+background jobs with result aggregation in original argument order. Shared blob
+downloads are serialized with per-digest locks to avoid races/corruption when
+images share layers.
 
 ---
 
 ## Low Priority
 
-### 4. Lock file
-Prevent two instances writing to same dir simultaneously (flock).
+### 5. Lock file — DONE
+~~Prevent two instances writing to same dir simultaneously (flock).~~
+Fixed: `flock -n` on `$dir/.docker_dn.lock`; second instance exits with
+EX_USAGE.
 
-### 5. Add to upstream CLI
+### 6. Add to upstream CLI
 Maybe it will become a usable wrapper to original scripts.
-Add to original cli `docker image download`.
+Add to original cli `docker image download` (or equivalent container-runtime integration).
 
-### 6. Python rewrite
+### 7. Python rewrite
 Bash script with complex logic (HTTP redirects, JSON parsing, state management).
 Python would simplify significantly — better error handling, argparse, requests library.
 

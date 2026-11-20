@@ -21,12 +21,41 @@ set -eo pipefail
 # debian                           latest              f6fab3b798be3174f45aa1eb731f8182705555f89c9026d8c1ef230cbf8301dd   10 weeks ago        85.1 MB
 
 # check if essential commands are in our PATH
-for cmd in curl jq aria2c tar gzip docker; do
+for cmd in curl jq aria2c tar gzip; do
 	if ! command -v "$cmd" &>/dev/null; then
 		echo >&2 "error: \"$cmd\" not found!"
 		exit 1
 	fi
 done
+
+# container runtime used for loading archives (docker or podman)
+runtimeArg="${CONTAINER_RUNTIME:-}"
+detect_runtime() {
+	if [ -n "$runtimeArg" ]; then
+		case "$runtimeArg" in
+			docker | podman)
+				if ! command -v "$runtimeArg" &>/dev/null; then
+					echo >&2 "error: requested runtime \"$runtimeArg\" not found"
+					exit $EX_USAGE
+				fi
+				RUNTIME="$runtimeArg"
+				;;
+			*)
+				echo >&2 "error: invalid runtime \"$runtimeArg\" (expected: docker or podman)"
+				exit $EX_USAGE
+				;;
+		esac
+		return 0
+	fi
+
+	if command -v podman &>/dev/null; then
+		RUNTIME="podman"
+	elif command -v docker &>/dev/null; then
+		RUNTIME="docker"
+	else
+		RUNTIME=""
+	fi
+}
 
 ###########################################
 # Cleanup on failure (#7)
@@ -46,19 +75,18 @@ EX_OK=0       # success
 EX_USAGE=1    # dependency missing / usage error
 EX_AUTH=2     # auth failure
 EX_DOWNLOAD=3 # download / checksum failure
-EX_DOCKER=4   # docker load failure
+EX_DOCKER=4   # container runtime load failure
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # Colors (disabled when not a terminal or --quiet)
 setup_colors() {
 	if [ -t 1 ] && [ "${quiet:-0}" -eq 0 ]; then
-		RED='\033[0;31m'
 		GREEN='\033[0;32m'
 		YELLOW='\033[0;33m'
 		NC='\033[0m'
 	else
-		RED='' GREEN='' YELLOW='' NC=''
+		GREEN='' YELLOW='' NC=''
 	fi
 }
 
@@ -72,8 +100,9 @@ usage() {
 	echo "  -f FILE       Read image list from file (one per line)"
 	echo "  -o FILE       Archive output filename (default: <image>.tar.gz)"
 	echo "  --proxy URL   Proxy URL for curl and aria2c (e.g. http://host:port)"
+	echo "  --runtime NAME  Container runtime for loading (docker or podman; default: auto-detect, or CONTAINER_RUNTIME)"
 	echo "  --clean       Remove download directory after successful load"
-	echo "  --no-load     Download and archive only, skip docker load"
+	echo "  --no-load     Download and archive only, skip container runtime load"
 	echo "  --dry-run     Show what would be downloaded, then exit"
 	echo "  --verbose     Show debug output"
 	echo "  --quiet       Suppress non-error output"
@@ -91,6 +120,7 @@ proxyUrl=
 archiveOut=
 verbose=0
 quiet=0
+runtimeArg="${CONTAINER_RUNTIME:-}"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -121,6 +151,10 @@ while [ $# -gt 0 ]; do
 			;;
 		--proxy)
 			proxyUrl="$2"
+			shift 2
+			;;
+		--runtime)
+			runtimeArg="$2"
 			shift 2
 			;;
 		--clean)
@@ -166,6 +200,9 @@ fi
 # initialize colors (needs quiet to be set)
 setup_colors
 
+# resolve container runtime (may be overridden via --runtime / CONTAINER_RUNTIME)
+detect_runtime
+
 # disk space check
 check_disk_space() {
 	local totalBytes="$1"
@@ -184,15 +221,35 @@ if [ -z "$dir" ] || [ ${#imageArgs[@]} -eq 0 ]; then
 	echo >&2 "error: -d and -i are required"
 	usage $EX_USAGE >&2
 fi
-mkdir -p "$dir"
+
+# container runtime is required only when we will load the archive
+if [ "$dryRun" -eq 0 ] && [ "$noLoad" -eq 0 ] && [ -z "$RUNTIME" ]; then
+	echo >&2 "error: neither \"docker\" nor \"podman\" found (required for loading; use --no-load to skip)"
+	exit $EX_USAGE
+fi
+
+if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+	echo >&2 "error: '$dir' exists and is not a directory"
+	exit $EX_USAGE
+fi
+mkdir -p "$dir" || { echo >&2 "error: cannot create directory '$dir'"; exit $EX_USAGE; }
+[ -w "$dir" ] || { echo >&2 "error: directory '$dir' is not writable"; exit $EX_USAGE; }
 touch "$dir/.done"
+
+# prevent two instances from writing to the same dir at once
+exec 9>"$dir/.docker_dn.lock"
+if ! flock -n 9; then
+	echo >&2 "error: another docker_dn instance is using '$dir' (lock held)"
+	exit $EX_USAGE
+fi
 
 # pass collected images to the processing loop
 set -- "${imageArgs[@]}"
 
 # hacky workarounds for Bash 3 support (no associative arrays)
-images=()
 rm -f "$dir"/tags-*.tmp
+rm -rf "$dir/.meta" "$dir/.manifest_entries" "$dir/.bloblocks"
+mkdir -p "$dir/.meta" "$dir/.manifest_entries" "$dir/.bloblocks"
 manifestJsonEntries=()
 doNotGenerateManifestJson=
 # repositories[busybox]='"latest": "...", "ubuntu-14.04": "..."'
@@ -261,13 +318,29 @@ get_token() {
 	local curlFlags=(-fsSL)
 	if [ "$quiet" -eq 1 ]; then curlFlags+=(-s); fi
 	if [ "$verbose" -eq 1 ]; then curlFlags+=(-v); fi
-	curl "${curlFlags[@]}" "${proxyArgs[@]}" "$tokenUrl" | jq --raw-output '.token'
+	curl "${curlFlags[@]}" "${proxyArgs[@]}" --retry 3 --retry-all-errors "$tokenUrl" | jq --raw-output '.token'
+}
+
+# Cached registry token for the current image. Registry tokens are valid for
+# ~300s, so fetch once per image rather than once per layer, and
+# re-authenticate only when a request actually comes back 401.
+registryToken=
+
+refresh_token() {
+	registryToken="$(get_token "$1")"
+}
+
+# record completed blob hash for resume (safe under concurrent jobs)
+record_done() {
+	local hash="$1"
+	(
+		flock 9
+		grep -qx "$hash" "$dir/.done" 2>/dev/null || echo "$hash" >> "$dir/.done"
+	) 9>"$dir/.done.lock"
 }
 
 # https://github.com/moby/moby/issues/33700
 fetch_blob() {
-	local token="$1"
-	shift
 	local image="$1"
 	shift
 	local digest="$1"
@@ -286,7 +359,28 @@ fetch_blob() {
 	# skip if target file already exists and is non-empty
 	if [ -s "$targetFile" ]; then
 		echo "  [resume] skipping ${digestHash:0:12} (file exists)"
-		echo "$digestHash" >> "$dir/.done"
+		record_done "$digestHash"
+		return 0
+	fi
+
+	# serialize concurrent blob downloads (important for parallel multi-image mode)
+	mkdir -p "$dir/.bloblocks"
+	local lockFile="$dir/.bloblocks/${digestHash}.lock"
+	exec 8>"$lockFile"
+	flock 8
+
+	# re-check after acquiring lock (another worker may have completed it)
+	if [ -f "$dir/.done" ] && grep -q "^${digestHash}$" "$dir/.done" 2>/dev/null; then
+		echo "  [resume] skipping ${digestHash:0:12}"
+		flock -u 8
+		exec 8>&-
+		return 0
+	fi
+	if [ -s "$targetFile" ]; then
+		echo "  [resume] skipping ${digestHash:0:12} (file exists)"
+		record_done "$digestHash"
+		flock -u 8
+		exec 8>&-
 		return 0
 	fi
 
@@ -295,10 +389,32 @@ fetch_blob() {
 	httpHeaders="$(
 		curl -sI \
 			"${proxyArgs[@]}" \
-			-H "Authorization: Bearer $token" \
+			-H "Authorization: Bearer $registryToken" \
 			"$registryBase/v2/$image/blobs/$digest"
 	)"
 	httpHeaders="$(echo "$httpHeaders" | tr -d '\r')"
+
+	# 401 means the cached token expired part-way through this image.
+	# Refresh once and re-probe. A second consecutive 401 is a genuine
+	# auth failure rather than an expiry, so stop instead of looping. The
+	# refreshed token lands in the global, so every later layer of this
+	# image reuses it instead of re-authenticating.
+	if grep -qE '^HTTP/[0-9.]+ 401' <<<"$httpHeaders"; then
+		refresh_token "$image"
+		httpHeaders=$(
+			curl -sI \
+			"${proxyArgs[@]}" \
+			-H "Authorization: Bearer $registryToken" \
+			"$registryBase/v2/$image/blobs/$digest"
+		)
+		httpHeaders="$(echo "$httpHeaders" | tr -d '\r')"
+		if grep -qE '^HTTP/[0-9.]+ 401' <<<"$httpHeaders"; then
+			echo >&2 "error: registry rejected token for '$image' (401)"
+			flock -u 8
+			exec 8>&-
+			return $EX_AUTH
+		fi
+	fi
 
 	local blobUrl
 	case "$httpHeaders" in
@@ -307,6 +423,8 @@ fetch_blob() {
 			if [ -z "$blobUrl" ]; then
 				echo >&2 "error: failed fetching '$image' blob '$digest'"
 				echo "$httpHeaders" | head -1 >&2
+				flock -u 8
+				exec 8>&-
 				return 1
 			fi
 			;;
@@ -323,14 +441,15 @@ fetch_blob() {
 	# redirect URLs (signed CDN) don't need auth header; direct URLs do
 	case "$httpHeaders" in
 		*"3"[0-9][0-9]*) ;;
-		*) aria2Args+=("--header=Authorization: Bearer $token") ;;
+		*) aria2Args+=("--header=Authorization: Bearer $registryToken") ;;
 	esac
 	if [ -n "$proxyUrl" ]; then
 		aria2Args+=("--all-proxy=$proxyUrl")
 	fi
-	aria2c "${aria2Args[@]}" "$blobUrl" -o "$targetFile"
-	if [ $? -ne 0 ]; then
+	if ! aria2c "${aria2Args[@]}" "$blobUrl" -o "$targetFile"; then
 		echo >&2 "error: aria2c failed for blob ${digestHash:0:12}"
+		flock -u 8
+		exec 8>&-
 		return $EX_DOWNLOAD
 	fi
 
@@ -343,11 +462,15 @@ fetch_blob() {
 		echo >&2 "  expected: $expected"
 		echo >&2 "  actual:   $actual"
 		rm -f "$targetFile"
+		flock -u 8
+		exec 8>&-
 		return $EX_DOWNLOAD
 	fi
 
 	# record success for resume
-	echo "$digestHash" >> "$dir/.done"
+	record_done "$digestHash"
+	flock -u 8
+	exec 8>&-
 }
 
 # handle 'application/vnd.docker.distribution.manifest.v2+json' manifest
@@ -362,7 +485,10 @@ handle_single_manifest_v2() {
 
 	local configDigest
 	configDigest="$(echo "$manifestJson" | jq --raw-output '.config.digest')"
-	local imageId="${configDigest#*:}" # strip off "sha256:"
+	# imageId must stay global: the caller's repositories writer (line ~740)
+	# reads it after this function returns, and the old-style repositories
+	# file keys tags to the last layer ID (see line ~503).
+	imageId="${configDigest#*:}" # strip off "sha256:"
 
 	# dry-run: show manifest info and return
 	if [ "$dryRun" -eq 1 ]; then
@@ -376,14 +502,14 @@ handle_single_manifest_v2() {
 			lDigest="$(echo "$manifestJson" | jq -r ".layers[$i].digest")"
 			lSize="$(echo "$manifestJson" | jq ".layers[$i].size")"
 			local lSizeMB=$((lSize / 1024 / 1024))
-			echo "  [$((i+1))/${layerCount}] ${lDigest#sha256:0:12}  (~${lSizeMB}MB)"
+			echo "  [$((i+1))/${layerCount}] ${lDigest:7:12}  (~${lSizeMB}MB)"
 			i=$((i + 1))
 		done
 		return 0
 	fi
 
 	local configFile="$imageId.json"
-	fetch_blob "$token" "$image" "$configDigest" "$dir/$configFile" "-s"
+	fetch_blob "$image" "$configDigest" "$dir/$configFile" "-s" || return $?
 
 	local layersFs
 	layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.layers[]')"
@@ -405,7 +531,7 @@ handle_single_manifest_v2() {
 		layerDigest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 
 		if [ "$quiet" -eq 0 ]; then
-			echo "  [${layerNum}/${#layers[@]}] ${layerDigest#sha256:0:12}"
+			echo "  [${layerNum}/${#layers[@]}] ${layerDigest:7:12}"
 		fi
 
 		# save the previous layer's ID
@@ -462,9 +588,7 @@ handle_single_manifest_v2() {
 				fi
 				continue
 			fi
-			local token
-			token="$(get_token "$image")"
-			fetch_blob "$token" "$image" "$layerDigest" "$dir/$layerTar"
+			fetch_blob "$image" "$layerDigest" "$dir/$layerTar" || return $?
 			;;
 
 		*)
@@ -491,6 +615,9 @@ handle_single_manifest_v2() {
 		}'
 	)"
 	manifestJsonEntries=("${manifestJsonEntries[@]}" "$manifestJsonEntry")
+	if [ -n "${MANIFEST_ENTRY_FILE:-}" ]; then
+		echo "$manifestJsonEntry" > "$MANIFEST_ENTRY_FILE"
+	fi
 }
 
 get_target_arch() {
@@ -559,67 +686,93 @@ get_target_variant() {
 	echo "${TARGETVARIANT:-}"
 }
 
-while [ $# -gt 0 ]; do
-	imageTag="$1"
-	shift
-	detect_registry "${imageTag%%[:@]*}"
-	imageTag="${imageTag#*:}"
-	digest="${imageTag##*@}"
-	tag="${imageTag%%@*}"
+process_one_image() {
+	local seq="$1"
+	local imageTag="$2"
+	local MANIFEST_ENTRY_FILE="$dir/.manifest_entries/${seq}.json"
+	: > "$MANIFEST_ENTRY_FILE"
 
-	imageFile="${image//\//_}" # "/" can't be in filenames :)
+	local rawImageArg="${imageTag%%[:@]*}"
+	detect_registry "$rawImageArg"
 
-	token="$(get_token "$image")"
+	# parse image[:tag][@digest]: rest is the optional ":tag" and/or "@digest"
+	local rest="${imageTag#"$rawImageArg"}"
+	local tag="${rest%%@*}"
+	tag="${tag#:}"
+	if [ -z "$tag" ]; then
+		tag="latest"
+	fi
+	local digest="${rest##*@}"
+	if [ "$digest" = "$rest" ]; then
+		digest= # no '@' → not digest-pinned
+	fi
+	local manifestRef
+	if [ -n "$digest" ]; then
+		manifestRef="$digest"
+	else
+		manifestRef="$tag"
+	fi
 
+	local imageFile="${rawImageArg//\//_}"
+
+	refresh_token "$image"
+
+	local manifestJson
 	manifestJson="$(
-		curl -fsSL \
+		curl -fsSL --retry 3 --retry-all-errors \
 			"${proxyArgs[@]}" \
-			-H "Authorization: Bearer $token" \
+			-H "Authorization: Bearer $registryToken" \
 			-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
 			-H 'Accept: application/vnd.oci.image.index.v1+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
 			-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
-			"$registryBase/v2/$image/manifests/$digest"
+			"$registryBase/v2/$image/manifests/$manifestRef"
 	)"
 	if [ "${manifestJson:0:1}" != '{' ]; then
-		echo >&2 "error: /v2/$image/manifests/$digest returned something unexpected:"
+		echo >&2 "error: /v2/$image/manifests/$manifestRef returned something unexpected:"
 		echo >&2 "  $manifestJson"
-		exit 1
+		return 1
 	fi
 
-	imageIdentifier="$image:$tag@$digest"
+	local imageIdentifier="$image:$tag${digest:+@$digest}"
 
+	local schemaVersion
 	schemaVersion="$(echo "$manifestJson" | jq --raw-output '.schemaVersion')"
 	case "$schemaVersion" in
 	2)
+		local mediaType
 		mediaType="$(echo "$manifestJson" | jq --raw-output '.mediaType')"
 
 		case "$mediaType" in
 		application/vnd.oci.image.manifest.v1+json | application/vnd.docker.distribution.manifest.v2+json)
-			handle_single_manifest_v2 "$manifestJson"
+			handle_single_manifest_v2 "$manifestJson" || return $?
 			;;
 		application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json)
+			local layersFs
 			layersFs="$(echo "$manifestJson" | jq --raw-output --compact-output '.manifests[]')"
-			IFS="$newlineIFS"
+			local IFS="$newlineIFS"
+			local layers
 			mapfile -t layers <<<"$layersFs"
 			unset IFS
 
-			found=""
+			local found=""
+			local targetArch targetVariant
 			targetArch="$(get_target_arch)"
 			targetVariant="$(get_target_variant)"
 			# parse first level multi-arch manifest
+			local i layerMeta maniArch maniVariant submanifestJson
 			for i in "${!layers[@]}"; do
 				layerMeta="${layers[$i]}"
 				maniArch="$(echo "$layerMeta" | jq --raw-output '.platform.architecture')"
 				maniVariant="$(echo "$layerMeta" | jq --raw-output '.platform.variant')"
-				if [[ "$maniArch" = "${targetArch}" ]] && [[ -z "${targetVariant}" || "$maniVariant" = "${targetVariant}" ]]; then
+				if [[ "$maniArch" = "$targetArch" ]] && [[ -z "$targetVariant" || "$maniVariant" = "$targetVariant" ]]; then
 					digest="$(echo "$layerMeta" | jq --raw-output '.digest')"
 					# get second level single manifest
 					submanifestJson="$(
-						curl -fsSL \
+						curl -fsSL --retry 3 --retry-all-errors \
 							"${proxyArgs[@]}" \
-							-H "Authorization: Bearer $token" \
+							-H "Authorization: Bearer $registryToken" \
 							-H 'Accept: application/vnd.oci.image.manifest.v1+json' \
 							-H 'Accept: application/vnd.oci.image.index.v1+json' \
 							-H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
@@ -627,57 +780,70 @@ while [ $# -gt 0 ]; do
 							-H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
 							"$registryBase/v2/$image/manifests/$digest"
 					)"
-					handle_single_manifest_v2 "$submanifestJson"
+					handle_single_manifest_v2 "$submanifestJson" || return $?
 					found="found"
 					break
 				fi
 			done
 			if [ -z "$found" ]; then
 				echo >&2 "error: manifest for ${targetArch}${targetVariant:+/${targetVariant}} is not found"
-				exit 1
+				return 1
 			fi
 			;;
 		*)
 			echo >&2 "error: unknown manifest mediaType ($imageIdentifier): '$mediaType'"
-			exit 1
+			return 1
 			;;
 		esac
 		;;
-
 	1)
-		if [ -z "$doNotGenerateManifestJson" ]; then
-			echo -e "${YELLOW}warning: '$imageIdentifier' uses schemaVersion '$schemaVersion'${NC}" >&2
-			echo >&2 "  this script cannot (currently) recreate the 'image config' to put in a 'manifest.json' (thus any schemaVersion 2+ images will be imported in the old way, and their 'docker history' will suffer)"
-			echo >&2
-			doNotGenerateManifestJson=1
-		fi
+		: > "$dir/.meta/no_manifest_json"
+		echo -e "${YELLOW}warning: '$imageIdentifier' uses schemaVersion '$schemaVersion'${NC}" >&2
+		echo >&2 "  this script cannot (currently) recreate the 'image config' to put in a 'manifest.json' (thus any schemaVersion 2+ images will be imported in the old way, and their 'docker history' will suffer)"
+		echo >&2
 
+		local layersFs
 		layersFs="$(echo "$manifestJson" | jq --raw-output '.fsLayers | .[] | .blobSum')"
-		IFS="$newlineIFS"
+		local IFS="$newlineIFS"
+		local layers
 		mapfile -t layers <<<"$layersFs"
 		unset IFS
 
 		# dry-run: show manifest info and return
 		if [ "$dryRun" -eq 1 ]; then
 			echo -e "${GREEN}[dry-run]${NC} $imageIdentifier — ${#layers[@]} layers (schema v1, size unknown)"
+			local li
 			for li in "${!layers[@]}"; do
-				echo "  [$((li+1))/${#layers[@]}] ${layers[$li]#sha256:0:12}"
+				echo "  [$((li+1))/${#layers[@]}] ${layers[$li]:7:12}"
 			done
-			continue
+			printf '%s\n' "$rawImageArg" > "$dir/.meta/${seq}.raw"
+			# schema v1 dry-run: cannot determine imageId reliably; record placeholder
+			printf '%s\n' "$tag" > "$dir/.meta/${seq}.tag"
+			printf '%s\n' "dryrun" > "$dir/.meta/${seq}.imageid"
+			{
+				flock 9
+				if [ -s "$dir/tags-$imageFile.tmp" ]; then
+					printf ', ' >>"$dir/tags-$imageFile.tmp"
+				fi
+				printf '"%s": "%s"' "$tag" "dryrun" >>"$dir/tags-$imageFile.tmp"
+			} 9>"$dir/.tagslock.$imageFile"
+			return 0
 		fi
 
+		local history
 		history="$(echo "$manifestJson" | jq '.history | [.[] | .v1Compatibility]')"
 		imageId="$(echo "$history" | jq --raw-output '.[0]' | jq --raw-output '.id')"
 
 		echo "Downloading '$imageIdentifier' (${#layers[@]} layers)..."
+		local i layerNum imageJson layerId imageLayer
 		for i in "${!layers[@]}"; do
-			local layerNum=$((i + 1))
+			layerNum=$((i + 1))
 			imageJson="$(echo "$history" | jq --raw-output ".[${i}]")"
 			layerId="$(echo "$imageJson" | jq --raw-output '.id')"
 			imageLayer="${layers[$i]}"
 
 			if [ "$quiet" -eq 0 ]; then
-				echo "  [${layerNum}/${#layers[@]}] ${imageLayer#sha256:0:12}"
+				echo "  [${layerNum}/${#layers[@]}] ${imageLayer:7:12}"
 			fi
 
 			mkdir -p "$dir/$layerId"
@@ -694,31 +860,74 @@ while [ $# -gt 0 ]; do
 				fi
 				continue
 			fi
-			token="$(get_token "$image")"
-			fetch_blob "$token" "$image" "$imageLayer" "$dir/$layerId/layer.tar"
+			fetch_blob "$image" "$imageLayer" "$dir/$layerId/layer.tar" || return $?
 		done
 		;;
-
 	*)
 		echo >&2 "error: unknown manifest schemaVersion ($imageIdentifier): '$schemaVersion'"
-		exit 1
+		return 1
 		;;
 	esac
 
 	echo
 
-	if [ -s "$dir/tags-$imageFile.tmp" ]; then
-		echo -n ', ' >>"$dir/tags-$imageFile.tmp"
-	else
-		images=("${images[@]}" "$image")
+	# record tags/repos info for aggregation
+	printf '%s\n' "$rawImageArg" > "$dir/.meta/${seq}.raw"
+	printf '%s\n' "$tag" > "$dir/.meta/${seq}.tag"
+	printf '%s\n' "$imageId" > "$dir/.meta/${seq}.imageid"
+	# update tags file (locked per imageFile to handle duplicate image refs)
+	{
+		flock 9
+		if [ -s "$dir/tags-$imageFile.tmp" ]; then
+			printf ', ' >>"$dir/tags-$imageFile.tmp"
+		fi
+		printf '"%s": "%s"' "$tag" "$imageId" >>"$dir/tags-$imageFile.tmp"
+	} 9>"$dir/.tagslock.$imageFile"
+
+	return 0
+}
+
+# process images (in parallel when multiple images are requested)
+pids=()
+seq=0
+for imageTag in "$@"; do
+	seq=$((seq + 1))
+	process_one_image "$seq" "$imageTag" &
+	pids+=("$!")
+done
+
+# wait for all image jobs
+failed=0
+for pid in "${pids[@]}"; do
+	if ! wait "$pid"; then
+		failed=1
 	fi
-	echo -n '"'"$tag"'": "'"$imageId"'"' >>"$dir/tags-$imageFile.tmp"
+done
+if [ "$failed" -ne 0 ]; then
+	echo >&2 "error: one or more image downloads failed"
+	exit $EX_DOWNLOAD
+fi
+
+# aggregate repositories and manifest in original argument order
+: > "$dir/repositories"
+: > "$dir/.meta/seen_images"
+images_ordered=()
+seq=1
+while [ "$seq" -le $# ]; do
+	if [ -f "$dir/.meta/${seq}.raw" ]; then
+		rawImageArg="$(cat "$dir/.meta/${seq}.raw")"
+		if ! grep -Fxq "$rawImageArg" "$dir/.meta/seen_images" 2>/dev/null; then
+			echo "$rawImageArg" >> "$dir/.meta/seen_images"
+			images_ordered+=("$rawImageArg")
+		fi
+	fi
+	seq=$((seq + 1))
 done
 
 echo -n '{' >"$dir/repositories"
 firstImage=1
-for image in "${images[@]}"; do
-	imageFile="${image//\//_}" # "/" can't be in filenames :)
+for image in "${images_ordered[@]}"; do
+	imageFile="${image//\//_}"
 	image="${image#library\/}"
 
 	[ "$firstImage" ] || echo -n ',' >>"$dir/repositories"
@@ -728,13 +937,29 @@ for image in "${images[@]}"; do
 done
 echo -n $'\n}\n' >>"$dir/repositories"
 
-rm -f "$dir"/tags-*.tmp
-
-if [ -z "$doNotGenerateManifestJson" ] && [ "${#manifestJsonEntries[@]}" -gt 0 ]; then
-	echo '[]' | jq --raw-output ".$(for entry in "${manifestJsonEntries[@]}"; do echo " + [ $entry ]"; done)" >"$dir/manifest.json"
+# collect manifest entries (schema v2) in original argument order
+if [ ! -f "$dir/.meta/no_manifest_json" ]; then
+	entries=()
+	seq=1
+	while [ "$seq" -le $# ]; do
+		f="$dir/.manifest_entries/${seq}.json"
+		if [ -s "$f" ]; then
+			entries+=("$(cat "$f")")
+		fi
+		seq=$((seq + 1))
+	done
+	if [ "${#entries[@]}" -gt 0 ]; then
+		echo '[]' | jq --raw-output ".$(for entry in "${entries[@]}"; do echo " + [ $entry ]"; done)" >"$dir/manifest.json"
+	else
+		rm -f "$dir/manifest.json"
+	fi
 else
 	rm -f "$dir/manifest.json"
 fi
+
+rm -f "$dir"/tags-*.tmp
+rm -f "$dir"/.tagslock.* 2>/dev/null || true
+rm -rf "$dir/.meta" "$dir/.manifest_entries" "$dir/.bloblocks"
 
 echo -e "${GREEN}Download of images into '$dir' complete.${NC}"
 
@@ -743,22 +968,44 @@ echo -e "${GREEN}Download of images into '$dir' complete.${NC}"
 ########################################################################################################
 if [ "$dryRun" -eq 0 ]; then
 	_download_complete=1
-	imageFile="${image//\//_}"
-	archiveName="${archiveOut:-${imageFile}.tar.gz}"
-	if [ "$quiet" -eq 0 ]; then
-		tar -cvC "${dir}" . | gzip -c -9 >"${archiveName}"
+	if [ -n "$archiveOut" ]; then
+		archiveName="$archiveOut"
+	elif [ "${#images_ordered[@]}" -gt 1 ]; then
+		# archive covers all images, so name it after all of them
+		imageFile="$(printf '%s+' "${images_ordered[@]}" | sed 's|/|_|g;s/+$//')"
+		archiveName="${imageFile}.tar.gz"
 	else
-		tar -cC "${dir}" . | gzip -c -9 >"${archiveName}"
+		imageFile="${images_ordered[0]//\//_}"
+		archiveName="${imageFile}.tar.gz"
+	fi
+	if [ "$quiet" -eq 0 ]; then
+		tar -cvC "${dir}" --exclude='./.docker_dn.lock' --exclude='./.done' --exclude='./.done.lock' . | gzip -c -1 >"${archiveName}"
+	else
+		tar -cC "${dir}" --exclude='./.docker_dn.lock' --exclude='./.done' --exclude='./.done.lock' . | gzip -c -1 >"${archiveName}"
 	fi
 	echo -e "${GREEN}Archive saved: ${archiveName}${NC}"
 
 	if [ "$noLoad" -eq 0 ]; then
-		if ! docker info &>/dev/null; then
-			echo -e "${YELLOW}warning: Docker daemon not reachable, skipping load${NC}" >&2
+		loadRuntime="$RUNTIME"
+		if ! "$loadRuntime" info &>/dev/null; then
+			if [ -z "$runtimeArg" ]; then
+				altRuntime=""
+				if [ "$loadRuntime" = "podman" ] && command -v docker &>/dev/null; then
+					altRuntime="docker"
+				elif [ "$loadRuntime" = "docker" ] && command -v podman &>/dev/null; then
+					altRuntime="podman"
+				fi
+				if [ -n "$altRuntime" ] && "$altRuntime" info &>/dev/null; then
+					echo -e "${YELLOW}warning: $loadRuntime not reachable, falling back to $altRuntime${NC}" >&2
+					loadRuntime="$altRuntime"
+				fi
+			fi
+		fi
+		if ! "$loadRuntime" info &>/dev/null; then
+			echo -e "${YELLOW}warning: $loadRuntime not reachable, skipping load${NC}" >&2
 		else
-			docker load -i "${archiveName}"
-			if [ $? -ne 0 ]; then
-				echo >&2 "error: docker load failed"
+			if ! "$loadRuntime" load -i "${archiveName}"; then
+				echo >&2 "error: $loadRuntime load failed"
 				exit $EX_DOCKER
 			fi
 		fi
@@ -770,8 +1017,8 @@ if [ "$dryRun" -eq 0 ]; then
 	fi
 fi
 
-# remove .done file on success (no longer needed)
-rm -f "$dir/.done"
+# remove .done files on success (no longer needed)
+rm -f "$dir/.done" "$dir/.done.lock"
 ########################################################################################################
 
 exit $EX_OK
