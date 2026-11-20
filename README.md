@@ -1,87 +1,96 @@
 # docker_dn
 
-Container image downloader — bypass `docker pull` / `podman pull` by downloading image layers directly from the registry.
+Download container images directly from registries, build a loadable tar archive, and optionally load it into Docker or Podman — without using `docker pull` or `podman pull`.
 
-Based on [Moby's `download-frozen-image-v2.sh`](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh) with improvements: `aria2c` parallel downloads, multi-registry support, resume, checksum verification, and colored output.
+Based on [Moby's `download-frozen-image-v2.sh`](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh), with support for parallel downloads, multi-image archives, resume/checksum verification, proxying, and Docker/Podman runtime detection.
 
-## Why
-
-When `docker pull` or `podman pull` is blocked (sanctions, 403 from docker.io, corporate proxies), this tool downloads image layers via `aria2c`, creates a tarball, and loads it into Docker or Podman.
-
-```bash
-# instead of:
-docker pull hello-world:latest
-# or
-podman pull hello-world:latest
-
-# use:
-./docker_dn -d output -i hello-world:latest
-```
-
-## Supported Registries
-
-| Registry | Prefix |
-|----------|--------|
-| Docker Hub | _(default)_ |
-| GitHub Container Registry | `ghcr.io/` |
-| Google Container Registry | `gcr.io/` |
-| Quay | `quay.io/` |
-
-## Install
-
-### Prerequisites
-
-```bash
-sudo apt install curl jq aria2c tar gzip
-# plus a container runtime for loading (optional with --no-load):
-sudo apt install docker.io   # or: sudo apt install podman
-```
-
-### Setup
+## Quick start
 
 ```bash
 git clone git@github.com:esmaeelE/docker_download.git
 cd docker_download
 chmod +x docker_dn
+
+./docker_dn -d out -i hello-world:latest
 ```
 
-Optional — install globally:
+This downloads `hello-world:latest`, creates an archive in `out/`, and loads it into an available container runtime.
+
+## Requirements
+
+- `bash`, `curl`, `jq`, `aria2c`, `tar`, `gzip`
+- `docker` or `podman` **only if loading** (not needed with `--dry-run` or `--no-load`)
+
+Example install (Debian/Ubuntu):
 
 ```bash
-sudo mv docker_dn /usr/local/bin/
+sudo apt install curl jq aria2c tar gzip
+# optional runtime for loading:
+sudo apt install podman   # or: sudo apt install docker.io
 ```
 
 ## Usage
 
-```
-docker_dn -d dir -i image[:tag][@digest] ... [options]
-
-Options:
-  -d DIR        Output directory for downloading layers
-  -i IMAGE      Image name with optional tag/digest (can be repeated)
-  -f FILE       Read image list from file (one per line)
-  -o FILE       Archive output filename (default: <image>.tar.gz; for multiple
-                -i images: <image1>+<image2>.tar.gz)
-  --proxy URL   Proxy URL for curl and aria2c (e.g. http://host:port)
-  --runtime NAME  Container runtime for loading (docker or podman; default: auto-detect, or CONTAINER_RUNTIME)
-  --clean       Remove download directory after successful load
-  --no-load     Download and archive only, skip container runtime load
-  --dry-run     Show what would be downloaded, then exit
-  --verbose     Show debug output
-  --quiet       Suppress non-error output
-  --version     Show version
-  -h, -?        Show this help message
+```text
+docker_dn -d DIR -i IMAGE[:TAG][@DIGEST] ... [options]
 ```
 
-When loading is enabled, `docker_dn` auto-detects an available container runtime (`podman` preferred if present, otherwise `docker`) and uses it to load the archive. If the selected runtime is not reachable, it falls back to the other runtime when available (unless `--runtime`/`CONTAINER_RUNTIME` is set). Use `--runtime` or `CONTAINER_RUNTIME` to force a specific runtime, and `--no-load` if no runtime is installed.
+| Option | Description |
+| --- | --- |
+| `-d DIR` | Output/download directory (required) |
+| `-i IMAGE` | Image reference; repeatable |
+| `-f FILE` | Read image references from file (one per line, `#` comments allowed) |
+| `-o FILE` | Output archive name (`<image>.tar.gz` by default; `<img1>+<img2>.tar.gz` for multiple images) |
+| `--proxy URL` | Proxy URL for `curl` and `aria2c` |
+| `--runtime NAME` | Runtime for loading: `docker` or `podman` (default: auto-detect or `CONTAINER_RUNTIME`) |
+| `--clean` | Remove download directory after successful load |
+| `--no-load` | Download and create archive only |
+| `--dry-run` | Show what would be downloaded, then exit |
+| `--verbose` | Verbose output |
+| `--quiet` | Suppress non-error output |
+| `--version` | Show version |
+| `-h`, `-?` | Show help |
 
-### Basic
+## Examples
+
+### Download and load
 
 ```bash
-./docker_dn -d hello_dir -i hello-world:latest
+./docker_dn -d out -i nginx:alpine
 ```
 
-### Force a specific runtime
+### Download only (no runtime load)
+
+```bash
+./docker_dn -d out -i nginx:alpine --no-load
+# archive: out/nginx.tar.gz
+# load later:
+#   docker load -i out/nginx.tar.gz
+#   podman load -i out/nginx.tar.gz
+```
+
+### Multiple images in one archive
+
+```bash
+./docker_dn -d out -i nginx:alpine -i redis:7 --no-load
+# archive: out/nginx+redis.tar.gz
+```
+
+When multiple images are requested, they are downloaded in parallel and bundled into a single archive with results kept in input order.
+
+### Batch from file
+
+```bash
+cat > images.txt <<'EOF'
+hello-world:latest
+ghcr.io/owner/app:1.2.3
+postgres:16
+EOF
+
+./docker_dn -d out -f images.txt --no-load
+```
+
+### Force a runtime
 
 ```bash
 ./docker_dn -d out -i nginx:alpine --runtime podman
@@ -89,102 +98,43 @@ When loading is enabled, `docker_dn` auto-detects an available container runtime
 CONTAINER_RUNTIME=docker ./docker_dn -d out -i nginx:alpine
 ```
 
-### Download only (no container runtime load)
-
-```bash
-./docker_dn -d out -i nginx:alpine --no-load
-# creates out/nginx.tar.gz
-# load later with: docker load -i out/nginx.tar.gz  (or: podman load -i out/nginx.tar.gz)
-```
-
-### Custom archive name
+### Custom archive name / proxy / quiet cleanup
 
 ```bash
 ./docker_dn -d out -i redis:7 -o redis-bundle.tar.gz
-```
-
-### Multiple images
-
-```bash
-./docker_dn -d out -i nginx:alpine -i redis:7 --no-load
-# creates out/nginx+redis.tar.gz containing both images,
-# loadable with one `docker load` or `podman load`
-```
-
-### Batch download from file
-
-```bash
-cat images.txt
-# hello-world:latest
-# nginx:alpine
-# postgres:16
-
-./docker_dn -d out -f images.txt --no-load
-```
-
-### With proxy
-
-```bash
 ./docker_dn -d out -i nginx:alpine --proxy http://10.0.0.1:8080
-```
-
-### Quiet mode (for scripts)
-
-```bash
 ./docker_dn -d out -i nginx:alpine --quiet --clean
 ```
 
-## Features
+## Supported registries
 
-- **Parallel downloads** — `aria2c` with 16 connections per layer
-- **Resume** — interrupted downloads resume from where they stopped (`.done` file tracks completed layers)
-- **Checksum verification** — SHA-256 verified against manifest digest after each download
-- **Disk space check** — warns if image size exceeds available disk space
-- **Multi-registry** — Docker Hub, GHCR, GCR, Quay auto-detected from image prefix
-- **Token caching** — one registry token fetched per image, reused across layers, refreshed once on 401
-- **Multi-image** — several `-i` images bundled into a single archive with correct per-registry `repositories` keys
-- **Parallel multi-image downloads** — when multiple images are requested, image downloads run concurrently and results are aggregated in input order
-- **Docker/Podman auto-detect** — auto-selects `podman` or `docker` for loading archives, with fallback to the other runtime if unreachable (or skip with `--no-load`)
-- **Colored output** — errors in red, warnings in yellow, success in green (auto-disabled in non-terminal / `--quiet`)
-- **Cleanup trap** — partial downloads preserved on failure for resume
+| Registry | Prefix | Example |
+| --- | --- | --- |
+| Docker Hub | _(default)_ | `hello-world:latest`, `library/alpine:3.20` |
+| GitHub Container Registry | `ghcr.io/` | `ghcr.io/owner/image:tag` |
+| Google Container Registry | `gcr.io/` | `gcr.io/project/image:tag` |
+| Quay | `quay.io/` | `quay.io/org/image:tag` |
 
-## Restricted Countries
+## Behavior notes
 
-If docker.io blocks your IP (403 Forbidden), use the built-in proxy flag:
+- **Runtime selection:** auto-detects `podman` first, then `docker`. If auto-detected runtime is unreachable, `docker_dn` may fall back to the other runtime; explicit `--runtime` / `CONTAINER_RUNTIME` disables fallback.
+- **Resume:** rerun with the same `-d` directory to continue interrupted downloads (completed blobs tracked in `.done`).
+- **Integrity:** downloaded blobs are verified against manifest SHA-256 digests.
+- **Concurrency safety:** the download directory is locked to prevent simultaneous writes by multiple instances.
+- **Archive naming:** single image -> `<image>.tar.gz`; multiple images -> `<image1>+<image2>.tar.gz` (slashes normalized), unless `-o` is set.
+- **Cleanup/failure:** partial downloads are preserved on failure for resume; `--clean` removes the download directory after a successful load flow.
 
-```bash
-./docker_dn -d out -i nginx:alpine --proxy 10.10.34.42:8080
-```
-
-Or set proxy via environment:
-
-```bash
-export {http,https,ftp}_proxy="10.10.34.42:8080"
-./docker_dn -d out -i nginx:alpine
-```
-
-Or use `proxychains`:
-
-```bash
-proxychains4 ./docker_dn -d out -i nginx:alpine
-```
-
-## Exit Codes
+## Exit codes
 
 | Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Usage error / dependency missing |
-| 2 | Auth failure |
-| 3 | Download / checksum failure |
-| 4 | Container runtime load failure |
-
-## Tested On
-
-- Debian 12, 13
-- Ubuntu 24.04
+| --- | --- |
+| `0` | Success |
+| `1` | Usage or dependency error |
+| `2` | Authentication failure |
+| `3` | Download or checksum failure |
+| `4` | Container runtime load failure |
 
 ## Links
 
-- [Baeldung post](https://www.baeldung.com/ops/docker-download-image-no-client)
-- [Moby's original script](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh)
+- [Moby: `download-frozen-image-v2.sh`](https://github.com/moby/moby/blob/master/contrib/download-frozen-image-v2.sh)
+- [Baeldung: Download Docker image without Docker client](https://www.baeldung.com/ops/docker-download-image-no-client)

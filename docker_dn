@@ -250,8 +250,6 @@ set -- "${imageArgs[@]}"
 rm -f "$dir"/tags-*.tmp
 rm -rf "$dir/.meta" "$dir/.manifest_entries" "$dir/.bloblocks"
 mkdir -p "$dir/.meta" "$dir/.manifest_entries" "$dir/.bloblocks"
-manifestJsonEntries=()
-doNotGenerateManifestJson=
 # repositories[busybox]='"latest": "...", "ubuntu-14.04": "..."'
 
 # bash v4 on Windows CI requires CRLF separator... and linux doesn't seem to care either way
@@ -614,7 +612,6 @@ handle_single_manifest_v2() {
 			Layers: '"$(echo '[]' | jq --raw-output --compact-output ".$(for layerFile in "${layerFiles[@]}"; do echo " + [ \"$layerFile\" ]"; done)")"'
 		}'
 	)"
-	manifestJsonEntries=("${manifestJsonEntries[@]}" "$manifestJsonEntry")
 	if [ -n "${MANIFEST_ENTRY_FILE:-}" ]; then
 		echo "$manifestJsonEntry" > "$MANIFEST_ENTRY_FILE"
 	fi
